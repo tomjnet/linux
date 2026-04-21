@@ -5,6 +5,16 @@ For general security related questions of perf_event_open() syscall usage,
 performance monitoring and observability operations by Perf see here:
 https://www.kernel.org/doc/html/latest/admin-guide/perf-security.html
 
+Perf userspace tooling hardening
+================================
+
+Besides perf_event_open() access control, the perf userspace tools also handle
+paths, trace text, and other externally influenced input.  Command-specific
+code should avoid passing path names through the shell and should bound text
+parsing so malformed or unexpectedly long input cannot overflow fixed-size
+buffers.  In particular, file paths should be treated as data, and long trace
+fragments may need to be ignored when they do not fit internal parsing buffers.
+
 Enabling LSM based mandatory access control (MAC) to perf_event_open() syscall
 ==============================================================================
 

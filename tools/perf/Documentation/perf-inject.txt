@@ -21,6 +21,10 @@ Build-ids are just the first user of perf-inject - potentially anything that
 needs userspace processing to augment the events stream with additional
 information could make use of this facility.
 
+When perf-inject needs to copy related kcore directory data, it treats file
+paths as data and uses direct command execution rather than shell expansion.
+This avoids interpreting shell metacharacters that may appear in path names.
+
 OPTIONS
 -------
 -b::

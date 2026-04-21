@@ -26,6 +26,9 @@ kernel's ftrace infrastructure.
   'perf ftrace profile' show a execution profile for each function including
   total, average, max time and the number of calls.
 
+For latency mode, perf ftrace parses trace text defensively and ignores
+overlong partial lines rather than extending fixed-size internal buffers.
+
 The following options apply to perf ftrace.
 
 COMMON OPTIONS
@@ -169,6 +172,9 @@ OPTIONS for 'perf ftrace latency'
 	Maximum latency for the start of the last bucket, in ms or ns (according to
 	-n/--use-nsec). The setting is ignored if the value results in more than
 	22 buckets.
+
+When using the ftrace text path instead of BPF, malformed or unexpectedly long
+trace fragments may be skipped from histogram parsing to keep the tool robust.
 
 OPTIONS for 'perf ftrace profile'
 ---------------------------------
