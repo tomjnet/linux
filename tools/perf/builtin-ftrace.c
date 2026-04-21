@@ -852,11 +852,13 @@ out:
 }
 
 static void make_histogram(struct perf_ftrace *ftrace, int buckets[],
-			   char *buf, size_t len, char *linebuf)
+			   char *buf, size_t len, char *linebuf,
+			   size_t linebuf_len, bool *line_overflow)
 {
 	int min_latency = ftrace->min_latency;
 	int max_latency = ftrace->max_latency;
 	unsigned int bucket_num = ftrace->bucket_num;
+	size_t line_len;
 	char *p, *q;
 	char *unit;
 	double num;
@@ -868,8 +870,13 @@ static void make_histogram(struct perf_ftrace *ftrace, int buckets[],
 	/* handle data line by line */
 	for (p = buf; (q = strchr(p, '\n')) != NULL; p = q + 1) {
 		*q = '\0';
-		/* move it to the line buffer */
-		strcat(linebuf, p);
+		if (!*line_overflow) {
+			line_len = strlen(linebuf);
+			if (strlen(p) >= linebuf_len - line_len)
+				*line_overflow = true;
+			else
+				memcpy(linebuf + line_len, p, strlen(p) + 1);
+		}
 
 		/*
 		 * parse trace output to get function duration like in
@@ -883,7 +890,7 @@ static void make_histogram(struct perf_ftrace *ftrace, int buckets[],
 		 *  1)   6.086 us    |  do_filp_open();
 		 *
 		 */
-		if (linebuf[0] == '#')
+		if (*line_overflow || linebuf[0] == '#')
 			goto next;
 
 		/* ignore CPU */
@@ -934,10 +941,17 @@ do_inc:
 next:
 		/* empty the line buffer for the next output  */
 		linebuf[0] = '\0';
+		*line_overflow = false;
 	}
 
 	/* preserve any remaining output (before newline) */
-	strcat(linebuf, p);
+	if (!*line_overflow) {
+		line_len = strlen(linebuf);
+		if (strlen(p) >= linebuf_len - line_len)
+			*line_overflow = true;
+		else
+			memcpy(linebuf + line_len, p, strlen(p) + 1);
+	}
 }
 
 static void display_histogram(struct perf_ftrace *ftrace, int buckets[])
@@ -1128,6 +1142,7 @@ static int __cmd_latency(struct perf_ftrace *ftrace)
 	int trace_fd;
 	char buf[4096];
 	char line[256];
+	bool line_overflow = false;
 	struct pollfd pollfd = {
 		.events = POLLIN,
 	};
@@ -1161,7 +1176,8 @@ static int __cmd_latency(struct perf_ftrace *ftrace)
 			if (n < 0)
 				break;
 
-			make_histogram(ftrace, buckets, buf, n, line);
+			make_histogram(ftrace, buckets, buf, n, line,
+				       sizeof(line), &line_overflow);
 		}
 	}
 
@@ -1178,7 +1194,8 @@ static int __cmd_latency(struct perf_ftrace *ftrace)
 		int n = read(trace_fd, buf, sizeof(buf) - 1);
 		if (n <= 0)
 			break;
-		make_histogram(ftrace, buckets, buf, n, line);
+		make_histogram(ftrace, buckets, buf, n, line,
+			       sizeof(line), &line_overflow);
 	}
 
 	read_func_latency(ftrace, buckets);

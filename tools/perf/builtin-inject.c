@@ -41,8 +41,10 @@
 #include <linux/hash.h>
 #include <ctype.h>
 #include <errno.h>
+#include <glob.h>
 #include <signal.h>
 #include <inttypes.h>
+#include <subcmd/run-command.h>
 
 struct guest_event {
 	struct perf_sample		sample;
@@ -2229,34 +2231,81 @@ static int feat_copy_cb(struct feat_copier *fc, int feat, struct feat_writer *fw
 	return 1; /* Feature section copied */
 }
 
-static int copy_kcore_dir(struct perf_inject *inject)
+static int copy_kcore_pattern(const char *src_pattern, const char *dst_path)
 {
-	char *cmd;
+	glob_t gl = { 0 };
+	struct child_process cmd = {
+		.no_stdin  = 1,
+		.no_stdout = 1,
+		.no_stderr = 1,
+	};
+	const char **argv;
+	size_t i;
+	size_t argc = 0;
 	int ret;
 
-	ret = asprintf(&cmd, "cp -r -n %s/kcore_dir* %s >/dev/null 2>&1",
-		       inject->input_name, inject->output.path);
+	ret = glob(src_pattern, GLOB_NOCHECK, NULL, &gl);
+	if (ret)
+		return -EINVAL;
+
+	argv = calloc(gl.gl_pathc + 6, sizeof(*argv));
+	if (!argv) {
+		globfree(&gl);
+		return -ENOMEM;
+	}
+
+	argv[argc++] = "cp";
+	argv[argc++] = "-r";
+	argv[argc++] = "-n";
+	argv[argc++] = "--";
+	for (i = 0; i < gl.gl_pathc; i++)
+		argv[argc++] = gl.gl_pathv[i];
+	argv[argc++] = dst_path;
+	argv[argc] = NULL;
+
+	cmd.argv = argv;
+	ret = run_command(&cmd);
+	free(argv);
+	globfree(&gl);
+
+	return ret;
+}
+
+static int copy_kcore_dir(struct perf_inject *inject)
+{
+	char *src_pattern;
+	int ret;
+
+	ret = asprintf(&src_pattern, "%s/kcore_dir*", inject->input_name);
 	if (ret < 0)
 		return ret;
-	pr_debug("%s\n", cmd);
-	ret = system(cmd);
-	free(cmd);
+
+	ret = copy_kcore_pattern(src_pattern, inject->output.path);
+	free(src_pattern);
+
 	return ret;
 }
 
 static int guest_session__copy_kcore_dir(struct guest_session *gs)
 {
 	struct perf_inject *inject = container_of(gs, struct perf_inject, guest_session);
-	char *cmd;
+	char *src_path;
+	char *dst_path;
 	int ret;
 
-	ret = asprintf(&cmd, "cp -r -n %s/kcore_dir %s/kcore_dir__%u >/dev/null 2>&1",
-		       gs->perf_data_file, inject->output.path, gs->machine_pid);
+	ret = asprintf(&src_path, "%s/kcore_dir", gs->perf_data_file);
 	if (ret < 0)
 		return ret;
-	pr_debug("%s\n", cmd);
-	ret = system(cmd);
-	free(cmd);
+
+	ret = asprintf(&dst_path, "%s/kcore_dir__%u", inject->output.path, gs->machine_pid);
+	if (ret < 0) {
+		free(src_path);
+		return ret;
+	}
+
+	ret = copy_kcore_pattern(src_path, dst_path);
+	free(src_path);
+	free(dst_path);
 	return ret;
 }
 
