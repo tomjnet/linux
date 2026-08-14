@@ -37,8 +37,6 @@
 #include "libata.h"
 #include "libata-transport.h"
 
-#define ATA_SCSI_RBUF_SIZE	2048
-
 static DEFINE_SPINLOCK(ata_scsi_rbuf_lock);
 static u8 ata_scsi_rbuf[ATA_SCSI_RBUF_SIZE];
 
@@ -1664,8 +1662,9 @@ static void ata_scsi_qc_done(struct ata_queued_cmd *qc, bool set_result,
 
 void ata_scsi_deferred_qc_work(struct work_struct *work)
 {
-	struct ata_port *ap =
-		container_of(work, struct ata_port, deferred_qc_work);
+	struct ata_link *link =
+		container_of(work, struct ata_link, deferred_qc_work);
+	struct ata_port *ap = link->ap;
 	struct ata_queued_cmd *qc;
 	unsigned long flags;
 
@@ -1676,37 +1675,96 @@ void ata_scsi_deferred_qc_work(struct work_struct *work)
 	 * such case, we should not need any more deferring the qc, so warn if
 	 * qc_defer() says otherwise.
 	 */
-	qc = ap->deferred_qc;
+	qc = link->deferred_qc;
 	if (qc && !ata_port_eh_scheduled(ap)) {
 		WARN_ON_ONCE(ap->ops->qc_defer(qc));
-		ap->deferred_qc = NULL;
-		ata_qc_issue(qc);
+		link->deferred_qc = NULL;
+		ata_qc_issue(ap, qc);
 	}
 
 	spin_unlock_irqrestore(ap->lock, flags);
 }
 
-void ata_scsi_requeue_deferred_qc(struct ata_port *ap)
+enum scsi_timeout_action ata_scsi_requeue_deferred_qc(struct ata_port *ap,
+					struct scsi_cmnd *timedout_scmd)
 {
-	struct ata_queued_cmd *qc = ap->deferred_qc;
+	enum scsi_timeout_action action = SCSI_EH_NOT_HANDLED;
+	struct ata_queued_cmd *qc;
+	struct ata_link *link;
+	u32 host_byte;
 
 	lockdep_assert_held(ap->lock);
 
 	/*
-	 * If we have a deferred qc when a reset occurs or NCQ commands fail,
-	 * do not try to be smart about what to do with this deferred command
-	 * and simply requeue it by completing it with DID_REQUEUE.
+	 * If we have deferred QCs when a reset, a timeout or an NCQ command
+	 * fails, do not try to be smart about what to do with the deferred
+	 * commands and simply terminate them and let the SCSI layer decide
+	 * what to do.
 	 */
-	if (qc) {
-		ap->deferred_qc = NULL;
-		cancel_work(&ap->deferred_qc_work);
-		ata_scsi_qc_done(qc, true, DID_REQUEUE << 16);
+	ata_for_each_link(link, ap, PMP_FIRST) {
+		qc = link->deferred_qc;
+		if (!qc)
+			continue;
+
+		/*
+		 * Clear the deferred QC so that the deferred work does not try
+		 * to issue it.
+		 */
+		link->deferred_qc = NULL;
+		cancel_work(&link->deferred_qc_work);
+
+		/*
+		 * We are going to complete some scsi command, either with
+		 * DID_TIME_OUT if the command timed out while waiting for being
+		 * issued, or with DID_REQUEUE if another command timed out or
+		 * we had a failed command. However, the block layer may re-issue
+		 * these commands immediately, keeping the scsi host busy and
+		 * thus preventing the SCSI EH task from running.
+		 * So schedule EH on the port to prevent accepting new commands
+		 * until everything is sorted out with the error or timeout that
+		 * got us here in the first place. Note that we set EH pending
+		 * on the port before calling ata_port_schedule_eh() so that we
+		 * do not reenter this function from ata_eh_set_pending() with
+		 * timedout_scmd being NULL and erroneously retry deferred QCs
+		 * that have timed out on other links.
+		 */
+		if (!ata_port_eh_scheduled(ap)) {
+			ap->pflags |= ATA_PFLAG_EH_PENDING;
+			ata_port_schedule_eh(ap);
+		}
+
+		/*
+		 * If we are being called from scsi_timeout(), then we have a
+		 * non-NULL timedout_scmd. If the timed out command is for a
+		 * deferred QC, terminate that deferred QC with DID_TIME_OUT and
+		 * requeue all other deferred QCs. In this case we need to
+		 * return SCSI_EH_DONE, because the timed out command was
+		 * handled.
+		 * If the timed out command is not for a deferred QC, we need to
+		 * requeue all deferred QCs, and return SCSI_EH_NOT_HANDLED so
+		 * that the timed out command gets added to the EH work queue
+		 * with scsi_eh_scmd_add(), for later handling with libata EH
+		 * ata_scsi_cmd_error_handler().
+		 * If timedout_scmd is NULL, we simply need to requeue all
+		 * deferred QCs and the return value does not matter as we were
+		 * not called from scsi_timeout().
+		 */
+		if (timedout_scmd && qc->scsicmd == timedout_scmd) {
+			host_byte = DID_TIME_OUT;
+			action = SCSI_EH_DONE;
+		} else {
+			host_byte = DID_REQUEUE;
+		}
+		ata_scsi_qc_done(qc, true, host_byte << 16);
 	}
+
+	return action;
 }
 
-static void ata_scsi_schedule_deferred_qc(struct ata_port *ap)
+static void ata_scsi_schedule_deferred_qc(struct ata_link *link)
 {
-	struct ata_queued_cmd *qc = ap->deferred_qc;
+	struct ata_queued_cmd *qc = link->deferred_qc;
+	struct ata_port *ap = link->ap;
 
 	lockdep_assert_held(ap->lock);
 
@@ -1719,16 +1777,45 @@ static void ata_scsi_schedule_deferred_qc(struct ata_port *ap)
 		return;
 
 	if (ata_port_eh_scheduled(ap)) {
-		ata_scsi_requeue_deferred_qc(ap);
+		ata_scsi_requeue_deferred_qc(ap, NULL);
 		return;
 	}
 	if (!ap->ops->qc_defer(qc))
-		queue_work(system_highpri_wq, &ap->deferred_qc_work);
+		queue_work(system_highpri_wq, &link->deferred_qc_work);
 }
+
+enum scsi_timeout_action ata_scsi_retry_deferred_qc(struct ata_port *ap,
+						    struct scsi_cmnd *scmd)
+{
+	enum scsi_timeout_action action;
+	unsigned long flags;
+
+	spin_lock_irqsave(ap->lock, flags);
+	action = ata_scsi_requeue_deferred_qc(ap, scmd);
+	spin_unlock_irqrestore(ap->lock, flags);
+
+	return action;
+}
+EXPORT_SYMBOL_GPL(ata_scsi_retry_deferred_qc);
+
+enum scsi_timeout_action ata_scsi_eh_timed_out(struct scsi_cmnd *scmd)
+{
+	struct ata_port *ap = ata_shost_to_port(scmd->device->host);
+
+	/*
+	 * ata_scsi_cmd_error_handler() takes care of commands that timed out
+	 * while executing. However, if we have deferred QCs while a timeout
+	 * triggers, we must requeue these commands for retry so that we do not
+	 * unnecessarily delay starting the SCSI EH task until these deferred
+	 * commands also time out.
+	 */
+	return ata_scsi_retry_deferred_qc(ap, scmd);
+}
+EXPORT_SYMBOL_GPL(ata_scsi_eh_timed_out);
 
 static void ata_scsi_qc_complete(struct ata_queued_cmd *qc)
 {
-	struct ata_port *ap = qc->ap;
+	struct ata_link *link = qc->dev->link;
 	struct scsi_cmnd *cmd = qc->scsicmd;
 	u8 *cdb = cmd->cmnd;
 	bool have_sense = qc->flags & ATA_QCFLAG_SENSE_VALID;
@@ -1759,22 +1846,24 @@ static void ata_scsi_qc_complete(struct ata_queued_cmd *qc)
 
 	ata_scsi_qc_done(qc, false, 0);
 
-	ata_scsi_schedule_deferred_qc(ap);
+	ata_scsi_schedule_deferred_qc(link);
 }
 
 static int ata_scsi_qc_issue(struct ata_port *ap, struct ata_queued_cmd *qc)
+	__must_hold(ap->lock)
 {
+	struct ata_link *link = qc->dev->link;
 	int ret;
 
 	if (!ap->ops->qc_defer)
-		goto issue;
+		goto issue_qc;
 
 	/*
 	 * If we already have a deferred qc, then rely on the SCSI layer to
 	 * requeue and defer all incoming commands until the deferred qc is
 	 * processed, once all on-going commands complete.
 	 */
-	if (ap->deferred_qc) {
+	if (link->deferred_qc) {
 		ata_qc_free(qc);
 		return SCSI_MLQUEUE_DEVICE_BUSY;
 	}
@@ -1786,38 +1875,46 @@ static int ata_scsi_qc_issue(struct ata_port *ap, struct ata_queued_cmd *qc)
 		break;
 	case ATA_DEFER_LINK:
 		ret = SCSI_MLQUEUE_DEVICE_BUSY;
-		break;
+		goto defer_qc;
+	case ATA_DEFER_LINK_EXCL:
+		/*
+		 * Drivers making use of ap->excl_link cannot store the QC in
+		 * link->deferred_qc, because the ap->excl_link handling is
+		 * incompatible with the link->deferred_qc workqueue handling.
+		 */
+		ret = SCSI_MLQUEUE_DEVICE_BUSY;
+		goto free_qc;
 	case ATA_DEFER_PORT:
 		ret = SCSI_MLQUEUE_HOST_BUSY;
-		break;
+		goto free_qc;
 	default:
 		WARN_ON_ONCE(1);
 		ret = SCSI_MLQUEUE_HOST_BUSY;
-		break;
+		goto free_qc;
 	}
 
-	if (ret) {
-		/*
-		 * We must defer this qc: if this is not an NCQ command, keep
-		 * this qc as a deferred one and report to the SCSI layer that
-		 * we issued it so that it is not requeued. The deferred qc will
-		 * be issued with the port deferred_qc_work once all on-going
-		 * commands complete.
-		 */
-		if (!ata_is_ncq(qc->tf.protocol)) {
-			ap->deferred_qc = qc;
-			return 0;
-		}
-
-		/* Force a requeue of the command to defer its execution. */
-		ata_qc_free(qc);
-		return ret;
-	}
-
-issue:
-	ata_qc_issue(qc);
-
+issue_qc:
+	ata_qc_issue(ap, qc);
 	return 0;
+
+defer_qc:
+	/*
+	 * We must defer this qc: if this is not an NCQ command, keep
+	 * this qc as a deferred one and report to the SCSI layer that
+	 * we issued it so that it is not requeued. The deferred qc will
+	 * be issued with the port deferred_qc_work once all on-going
+	 * commands complete.
+	 */
+	if (!ata_is_ncq(qc->tf.protocol)) {
+		link->deferred_qc = qc;
+		return 0;
+	}
+
+free_qc:
+	/* Force a requeue of the command to defer its execution. */
+	ata_qc_free(qc);
+
+	return ret;
 }
 
 /**
@@ -1825,6 +1922,7 @@ issue:
  *	@dev: ATA device to which the command is addressed
  *	@cmd: SCSI command to execute
  *	@xlat_func: Actor which translates @cmd to an ATA taskfile
+ *	@ap: ATA port of interest
  *
  *	Our ->queuecommand() function has decided that the SCSI
  *	command issued can be directly translated into an ATA
@@ -1847,9 +1945,9 @@ issue:
  *	command needs to be deferred.
  */
 static int ata_scsi_translate(struct ata_device *dev, struct scsi_cmnd *cmd,
-			      ata_xlat_func_t xlat_func)
+			      ata_xlat_func_t xlat_func, struct ata_port *ap)
+	__must_hold(ap->lock)
 {
-	struct ata_port *ap = dev->link->ap;
 	struct ata_queued_cmd *qc;
 
 	lockdep_assert_held(ap->lock);
@@ -1916,8 +2014,13 @@ static void ata_scsi_rbuf_fill(struct ata_device *dev, struct scsi_cmnd *cmd,
 	memset(ata_scsi_rbuf, 0, ATA_SCSI_RBUF_SIZE);
 	len = actor(dev, cmd, ata_scsi_rbuf);
 	if (len) {
+		if (WARN_ON(len > ATA_SCSI_RBUF_SIZE)) {
+			ata_scsi_set_sense(dev, cmd, ABORTED_COMMAND, 0, 0);
+			spin_unlock_irqrestore(&ata_scsi_rbuf_lock, flags);
+			return;
+		}
 		sg_copy_from_buffer(scsi_sglist(cmd), scsi_sg_count(cmd),
-				    ata_scsi_rbuf, ATA_SCSI_RBUF_SIZE);
+				    ata_scsi_rbuf, len);
 		cmd->result = SAM_STAT_GOOD;
 		if (scsi_bufflen(cmd) > len)
 			scsi_set_resid(cmd, scsi_bufflen(cmd) - len);
@@ -2891,6 +2994,7 @@ static void atapi_fixup_inquiry(struct scsi_cmnd *cmd)
 
 static void atapi_qc_complete(struct ata_queued_cmd *qc)
 {
+	struct ata_link *link = qc->dev->link;
 	struct scsi_cmnd *cmd = qc->scsicmd;
 	unsigned int err_mask = qc->err_mask;
 
@@ -2916,8 +3020,16 @@ static void atapi_qc_complete(struct ata_queued_cmd *qc)
 		if (qc->cdb[0] == ALLOW_MEDIUM_REMOVAL && qc->dev->sdev)
 			qc->dev->sdev->locked = 0;
 
-		ata_scsi_qc_done(qc, true, SAM_STAT_CHECK_CONDITION);
-		return;
+		if (cmd->result)
+			ata_scsi_qc_done(qc, false, 0);
+		else
+			ata_scsi_qc_done(qc, true, SAM_STAT_CHECK_CONDITION);
+		goto schedule_deferred;
+	}
+
+	if (cmd->result) {
+		ata_scsi_qc_done(qc, false, 0);
+		goto schedule_deferred;
 	}
 
 	/* successful completion path */
@@ -2925,6 +3037,9 @@ static void atapi_qc_complete(struct ata_queued_cmd *qc)
 		atapi_fixup_inquiry(cmd);
 
 	ata_scsi_qc_done(qc, true, SAM_STAT_GOOD);
+
+schedule_deferred:
+	ata_scsi_schedule_deferred_qc(link);
 }
 /**
  *	atapi_xlat - Initialize PACKET taskfile
@@ -4506,9 +4621,10 @@ static void ata_scsi_simulate(struct ata_device *dev, struct scsi_cmnd *cmd)
 }
 
 enum scsi_qc_status __ata_scsi_queuecmd(struct scsi_cmnd *scmd,
-					struct ata_device *dev)
+					struct ata_device *dev,
+					struct ata_port *ap)
+	__must_hold(ap->lock)
 {
-	struct ata_port *ap = dev->link->ap;
 	u8 scsi_op = scmd->cmnd[0];
 	ata_xlat_func_t xlat_func;
 
@@ -4549,7 +4665,7 @@ enum scsi_qc_status __ata_scsi_queuecmd(struct scsi_cmnd *scmd,
 	}
 
 	if (xlat_func)
-		return ata_scsi_translate(dev, scmd, xlat_func);
+		return ata_scsi_translate(dev, scmd, xlat_func, ap);
 
 	ata_scsi_simulate(dev, scmd);
 
@@ -4595,7 +4711,7 @@ enum scsi_qc_status ata_scsi_queuecmd(struct Scsi_Host *shost,
 
 	dev = ata_scsi_find_dev(ap, scsidev);
 	if (likely(dev))
-		rc = __ata_scsi_queuecmd(cmd, dev);
+		rc = __ata_scsi_queuecmd(cmd, dev, ap);
 	else {
 		cmd->result = (DID_BAD_TARGET << 16);
 		scsi_done(cmd);
@@ -4753,7 +4869,7 @@ void ata_scsi_scan_host(struct ata_port *ap, int sync)
 			     "WARNING: synchronous SCSI scan failed without making any progress, switching to async\n");
 	}
 
-	queue_delayed_work(system_long_wq, &ap->hotplug_task,
+	queue_delayed_work(system_dfl_long_wq, &ap->hotplug_task,
 			   round_jiffies_relative(HZ));
 }
 

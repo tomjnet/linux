@@ -103,21 +103,25 @@ enum scx_ent_flags {
 	SCX_TASK_IMMED		= 1 << 5, /* task is on local DSQ with %SCX_ENQ_IMMED */
 
 	/*
-	 * Bits 8 and 9 are used to carry task state:
+	 * Bits 8 to 10 are used to carry task state:
 	 *
 	 * NONE		ops.init_task() not called yet
+	 * INIT_BEGIN	ops.init_task() in flight; see sched_ext_dead()
 	 * INIT		ops.init_task() succeeded, but task can be cancelled
 	 * READY	fully initialized, but not in sched_ext
 	 * ENABLED	fully initialized and in sched_ext
+	 * DEAD		terminal state set by sched_ext_dead()
 	 */
-	SCX_TASK_STATE_SHIFT	= 8,	  /* bits 8 and 9 are used to carry task state */
-	SCX_TASK_STATE_BITS	= 2,
+	SCX_TASK_STATE_SHIFT	= 8,
+	SCX_TASK_STATE_BITS	= 3,
 	SCX_TASK_STATE_MASK	= ((1 << SCX_TASK_STATE_BITS) - 1) << SCX_TASK_STATE_SHIFT,
 
 	SCX_TASK_NONE		= 0 << SCX_TASK_STATE_SHIFT,
-	SCX_TASK_INIT		= 1 << SCX_TASK_STATE_SHIFT,
-	SCX_TASK_READY		= 2 << SCX_TASK_STATE_SHIFT,
-	SCX_TASK_ENABLED	= 3 << SCX_TASK_STATE_SHIFT,
+	SCX_TASK_INIT_BEGIN	= 1 << SCX_TASK_STATE_SHIFT,
+	SCX_TASK_INIT		= 2 << SCX_TASK_STATE_SHIFT,
+	SCX_TASK_READY		= 3 << SCX_TASK_STATE_SHIFT,
+	SCX_TASK_ENABLED	= 4 << SCX_TASK_STATE_SHIFT,
+	SCX_TASK_DEAD		= 5 << SCX_TASK_STATE_SHIFT,
 
 	/*
 	 * Bits 12 and 13 are used to carry reenqueue reason. In addition to
@@ -203,6 +207,15 @@ struct sched_ext_entity {
 	u64			core_sched_at;	/* see scx_prio_less() */
 #endif
 
+	/*
+	 * Unique non-zero task ID assigned at fork. Persists across exec and
+	 * is never reused. Lets BPF schedulers identify tasks without storing
+	 * kernel pointers - arena-backed schedulers being one example. See
+	 * scx_bpf_tid_to_task().
+	 */
+	u64			tid;
+	struct rhash_head	tid_hash_node;	/* see SCX_OPS_TID_TO_TASK */
+
 	/* BPF scheduler modifiable fields */
 
 	/*
@@ -231,11 +244,11 @@ struct sched_ext_entity {
 	 * to %SCHED_EXT with -%EACCES.
 	 *
 	 * Can be set from ops.init_task() while the BPF scheduler is being
-	 * loaded (!scx_init_task_args->fork). If set and the task's policy is
-	 * already %SCHED_EXT, the task's policy is rejected and forcefully
-	 * reverted to %SCHED_NORMAL. The number of such events are reported
-	 * through /sys/kernel/debug/sched_ext::nr_rejected. Setting this flag
-	 * during fork is not allowed.
+	 * loaded. If set and the task's policy is already %SCHED_EXT, the
+	 * task's policy is rejected and forcefully reverted to %SCHED_NORMAL.
+	 * The number of such events are reported through
+	 * /sys/kernel/sched_ext/nr_rejected. Setting this flag from any other
+	 * ops.init_task() invocation, such as during fork, fails the scheduler.
 	 */
 	bool			disallow;	/* reject switching into SCX */
 

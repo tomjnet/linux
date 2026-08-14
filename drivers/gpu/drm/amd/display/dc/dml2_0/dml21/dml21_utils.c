@@ -88,6 +88,7 @@ int dml21_find_dc_pipes_for_plane(const struct dc *in_dc,
 		struct pipe_ctx *dc_phantom_pipes[__DML2_WRAPPER_MAX_STREAMS_PLANES__],
 		int dml_plane_idx)
 {
+	(void)in_dc;
 	unsigned int dml_stream_index;
 	unsigned int main_stream_id;
 	unsigned int dc_plane_index;
@@ -266,7 +267,7 @@ static struct dc_stream_state *dml21_add_phantom_stream(struct dml2_context *dml
 	phantom_stream->dst.height = stream_programming->phantom_stream.descriptor.timing.v_active;
 
 	phantom_stream->src.y = 0;
-	phantom_stream->src.height = (double)phantom_stream_descriptor->timing.v_active * (double)main_stream->src.height / (double)main_stream->dst.height;
+	phantom_stream->src.height = (int)((double)phantom_stream_descriptor->timing.v_active * (double)main_stream->src.height / (double)main_stream->dst.height);
 
 	phantom_stream->use_dynamic_meta = false;
 
@@ -282,6 +283,7 @@ static struct dc_plane_state *dml21_add_phantom_plane(struct dml2_context *dml_c
 	struct dc_plane_state *main_plane,
 	struct dml2_per_plane_programming *plane_programming)
 {
+	(void)plane_programming;
 	struct dc_plane_state *phantom_plane;
 
 	phantom_plane = dml_ctx->config.svp_pstate.callbacks.create_phantom_plane(dc, context, main_plane);
@@ -357,14 +359,13 @@ void dml21_handle_phantom_streams_planes(const struct dc *dc, struct dc_state *c
 					main_plane = main_stream_status->plane_states[dc_plane_index];
 
 					/* create phantom planes for subvp enabled plane */
-					dml21_add_phantom_plane(dml_ctx,
-							dc,
-							context,
-							phantom_stream,
-							main_plane,
-							&dml_ctx->v21.mode_programming.programming->plane_programming[dml_plane_index]);
-
-					phantoms_added = true;
+					if (dml21_add_phantom_plane(dml_ctx,
+								    dc,
+								    context,
+								    phantom_stream,
+								    main_plane,
+								    &dml_ctx->v21.mode_programming.programming->plane_programming[dml_plane_index]))
+						phantoms_added = true;
 				}
 			}
 		}

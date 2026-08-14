@@ -122,7 +122,8 @@ config MDIO_MVUSB
 
 config MDIO_MSCC_MIIM
 	tristate "Microsemi MIIM interface support"
-	depends on HAS_IOMEM && REGMAP_MMIO
+	depends on HAS_IOMEM
+	select REGMAP_MMIO
 	help
 	  This driver supports the MIIM (MDIO) interface found in the network
 	  switches of the Microsemi SoCs; it is recommended to switch on
@@ -147,6 +148,7 @@ config MDIO_OCTEON
 
 config MDIO_PIC64HPSC
 	tristate "PIC64-HPSC/HX MDIO interface support"
+	depends on ARCH_MICROCHIP || COMPILE_TEST
 	depends on HAS_IOMEM && OF_MDIO
 	help
 	  This driver supports the MDIO interface found on the PIC64-HPSC/HX
@@ -253,7 +255,7 @@ config MDIO_BUS_MUX_BCM_IPROC
 
 config MDIO_BUS_MUX_GPIO
 	tristate "GPIO controlled MDIO bus multiplexers"
-	depends on OF_GPIO && OF_MDIO
+	depends on OF_MDIO
 	select MDIO_BUS_MUX
 	help
 	  This module provides a driver for MDIO bus multiplexers that

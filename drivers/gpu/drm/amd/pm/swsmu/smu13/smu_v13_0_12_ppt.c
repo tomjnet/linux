@@ -434,7 +434,8 @@ int smu_v13_0_12_get_smu_metrics_data(struct smu_context *smu,
 		*value = SMUQ10_ROUND(metrics->DramBandwidthUtilization);
 		break;
 	case METRICS_CURR_SOCKETPOWER:
-		*value = SMUQ10_ROUND(metrics->SocketPower) << 8;
+		*value = SMUQ10_ROUND(metrics->SocketPower) *
+			 MILLIWATT_PER_WATT;
 		break;
 	case METRICS_TEMPERATURE_HOTSPOT:
 		*value = SMUQ10_ROUND(metrics->MaxSocketTemperature) *
@@ -479,9 +480,14 @@ static int smu_v13_0_12_get_system_metrics_table(struct smu_context *smu)
 	}
 
 	amdgpu_hdp_invalidate(smu->adev, NULL);
+
+	ret = smu_cmn_vram_cpy(smu, sys_table->cache.buffer,
+			       table->cpu_addr,
+			       smu_v13_0_12_get_system_metrics_size());
+	if (ret)
+		return ret;
+
 	smu_table_cache_update_time(sys_table, jiffies);
-	memcpy(sys_table->cache.buffer, table->cpu_addr,
-	       smu_v13_0_12_get_system_metrics_size());
 
 	return 0;
 }

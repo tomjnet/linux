@@ -275,8 +275,12 @@ static void xe_exec_queue_set_lrc(struct xe_exec_queue *q, struct xe_lrc *lrc, u
 {
 	xe_assert(gt_to_xe(q->gt), idx < q->width);
 
-	scoped_guard(spinlock, &q->lrc_lookup_lock)
+	scoped_guard(spinlock, &q->lrc_lookup_lock) {
 		q->lrc[idx] = lrc;
+		if (xe_exec_queue_is_multi_queue(q))
+			q->lrc[idx]->multi_queue.primary_lrc =
+				q->multi_queue.group->primary->lrc[0];
+	}
 }
 
 /**
@@ -801,6 +805,9 @@ static int exec_queue_set_hang_replay_state(struct xe_device *xe,
 	u64 __user *address = u64_to_user_ptr(value);
 	void *ptr;
 
+	if (q->replay_state)
+		return -EINVAL;
+
 	ptr = vmemdup_user(address, size);
 	if (XE_IOCTL_DBG(xe, IS_ERR(ptr)))
 		return PTR_ERR(ptr);
@@ -850,11 +857,6 @@ static int xe_exec_queue_group_init(struct xe_device *xe, struct xe_exec_queue *
 	}
 
 	return 0;
-}
-
-static inline bool xe_exec_queue_supports_multi_queue(struct xe_exec_queue *q)
-{
-	return q->gt->info.multi_queue_engine_class_mask & BIT(q->class);
 }
 
 static int xe_exec_queue_group_validate(struct xe_device *xe, struct xe_exec_queue *q,
@@ -912,6 +914,7 @@ static int xe_exec_queue_group_add(struct xe_device *xe, struct xe_exec_queue *q
 	}
 
 	q->multi_queue.pos = pos;
+	q->lrc[0]->multi_queue.pos = pos;
 
 	return 0;
 }
@@ -931,7 +934,7 @@ static void xe_exec_queue_group_delete(struct xe_device *xe, struct xe_exec_queu
 static int exec_queue_set_multi_group(struct xe_device *xe, struct xe_exec_queue *q,
 				      u64 value)
 {
-	if (XE_IOCTL_DBG(xe, !xe_exec_queue_supports_multi_queue(q)))
+	if (XE_IOCTL_DBG(xe, !xe_gt_supports_multi_queue(q->gt, q->class)))
 		return -ENODEV;
 
 	if (XE_IOCTL_DBG(xe, !xe_device_uc_enabled(xe)))
@@ -1405,7 +1408,7 @@ int xe_exec_queue_create_ioctl(struct drm_device *dev, void *data,
 		if (q->vm && q->hwe->hw_engine_group) {
 			err = xe_hw_engine_group_add_exec_queue(q->hwe->hw_engine_group, q);
 			if (err)
-				goto put_exec_queue;
+				goto kill_exec_queue;
 		}
 	}
 
@@ -1416,12 +1419,15 @@ int xe_exec_queue_create_ioctl(struct drm_device *dev, void *data,
 	/* user id alloc must always be last in ioctl to prevent UAF */
 	err = xa_alloc(&xef->exec_queue.xa, &id, q, xa_limit_32b, GFP_KERNEL);
 	if (err)
-		goto kill_exec_queue;
+		goto del_hw_engine_group;
 
 	args->exec_queue_id = id;
 
 	return 0;
 
+del_hw_engine_group:
+	if (q->vm && q->hwe && q->hwe->hw_engine_group)
+		xe_hw_engine_group_del_exec_queue(q->hwe->hw_engine_group, q);
 kill_exec_queue:
 	xe_exec_queue_kill(q);
 delete_queue_group:
@@ -1760,7 +1766,7 @@ void xe_exec_queue_tlb_inval_last_fence_put(struct xe_exec_queue *q,
 void xe_exec_queue_tlb_inval_last_fence_put_unlocked(struct xe_exec_queue *q,
 						     unsigned int type)
 {
-	xe_assert(q->vm->xe, type == XE_EXEC_QUEUE_TLB_INVAL_MEDIA_GT ||
+	xe_assert(gt_to_xe(q->gt), type == XE_EXEC_QUEUE_TLB_INVAL_MEDIA_GT ||
 		  type == XE_EXEC_QUEUE_TLB_INVAL_PRIMARY_GT);
 
 	dma_fence_put(q->tlb_inval[type].last_fence);

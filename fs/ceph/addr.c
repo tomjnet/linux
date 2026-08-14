@@ -19,6 +19,7 @@
 #include "mds_client.h"
 #include "cache.h"
 #include "metric.h"
+#include "subvolume_metrics.h"
 #include "crypto.h"
 #include <linux/ceph/osd_client.h>
 #include <linux/ceph/striper.h>
@@ -259,6 +260,10 @@ static void finish_netfs_read(struct ceph_osd_request *req)
 					osd_data->length), false);
 	}
 	if (err > 0) {
+		ceph_subvolume_metrics_record_io(fsc->mdsc, ceph_inode(inode),
+						 false, err,
+						 req->r_start_latency,
+						 req->r_end_latency);
 		subreq->transferred = err;
 		err = 0;
 	}
@@ -785,6 +790,9 @@ static int write_folio_nounlock(struct folio *folio,
 				    ceph_wbc.truncate_size, true);
 	if (IS_ERR(req)) {
 		folio_redirty_for_writepage(wbc, folio);
+		if (atomic_long_dec_return(&fsc->writeback_count) <
+				CONGESTION_OFF_THRESH(fsc->mount_options->congestion_kb))
+			fsc->write_congested = false;
 		return PTR_ERR(req);
 	}
 
@@ -804,6 +812,9 @@ static int write_folio_nounlock(struct folio *folio,
 			folio_redirty_for_writepage(wbc, folio);
 			folio_end_writeback(folio);
 			ceph_osdc_put_request(req);
+			if (atomic_long_dec_return(&fsc->writeback_count) <
+					CONGESTION_OFF_THRESH(fsc->mount_options->congestion_kb))
+				fsc->write_congested = false;
 			return PTR_ERR(bounce_page);
 		}
 	}
@@ -823,6 +834,10 @@ static int write_folio_nounlock(struct folio *folio,
 
 	ceph_update_write_metrics(&fsc->mdsc->metric, req->r_start_latency,
 				  req->r_end_latency, len, err);
+	if (err >= 0 && len > 0)
+		ceph_subvolume_metrics_record_io(fsc->mdsc, ci, true, len,
+						 req->r_start_latency,
+						 req->r_end_latency);
 	fscrypt_free_bounce_page(bounce_page);
 	ceph_osdc_put_request(req);
 	if (err == 0)
@@ -838,6 +853,9 @@ static int write_folio_nounlock(struct folio *folio,
 			      ceph_vinop(inode), folio);
 			folio_redirty_for_writepage(wbc, folio);
 			folio_end_writeback(folio);
+			if (atomic_long_dec_return(&fsc->writeback_count) <
+					CONGESTION_OFF_THRESH(fsc->mount_options->congestion_kb))
+				fsc->write_congested = false;
 			return err;
 		}
 		if (err == -EBLOCKLISTED)
@@ -962,6 +980,11 @@ static void writepages_finish(struct ceph_osd_request *req)
 
 	ceph_update_write_metrics(&fsc->mdsc->metric, req->r_start_latency,
 				  req->r_end_latency, len, rc);
+
+	if (rc >= 0 && len > 0)
+		ceph_subvolume_metrics_record_io(mdsc, ci, true, len,
+						 req->r_start_latency,
+						 req->r_end_latency);
 
 	ceph_put_wrbuffer_cap_refs(ci, total_pages, snapc);
 
@@ -1322,6 +1345,7 @@ void ceph_process_folio_batch(struct address_space *mapping,
 						  ceph_wbc, folio);
 		if (rc == -ENODATA) {
 			folio_unlock(folio);
+			folio_put(folio);
 			ceph_wbc->fbatch.folios[i] = NULL;
 			continue;
 		} else if (rc == -E2BIG) {
@@ -1332,6 +1356,7 @@ void ceph_process_folio_batch(struct address_space *mapping,
 		if (!folio_clear_dirty_for_io(folio)) {
 			doutc(cl, "%p !folio_clear_dirty_for_io\n", folio);
 			folio_unlock(folio);
+			folio_put(folio);
 			ceph_wbc->fbatch.folios[i] = NULL;
 			continue;
 		}
@@ -1365,6 +1390,10 @@ void ceph_process_folio_batch(struct address_space *mapping,
 		rc = move_dirty_folio_in_page_array(mapping, wbc, ceph_wbc,
 				folio);
 		if (rc) {
+			/* Did we just begin a new contiguous op? Nevermind! */
+			if (ceph_wbc->len == 0)
+				ceph_wbc->num_ops--;
+
 			folio_redirty_for_writepage(wbc, folio);
 			folio_unlock(folio);
 			break;
@@ -2541,7 +2570,8 @@ int ceph_pool_perm_check(struct inode *inode, int need)
 	struct ceph_inode_info *ci = ceph_inode(inode);
 	struct ceph_string *pool_ns;
 	s64 pool;
-	int ret, flags;
+	int ret;
+	unsigned long flags;
 
 	/* Only need to do this for regular files */
 	if (!S_ISREG(inode->i_mode))
@@ -2583,20 +2613,19 @@ check:
 	if (ret < 0)
 		return ret;
 
-	flags = CEPH_I_POOL_PERM;
-	if (ret & POOL_READ)
-		flags |= CEPH_I_POOL_RD;
-	if (ret & POOL_WRITE)
-		flags |= CEPH_I_POOL_WR;
-
 	spin_lock(&ci->i_ceph_lock);
 	if (pool == ci->i_layout.pool_id &&
 	    pool_ns == rcu_dereference_raw(ci->i_layout.pool_ns)) {
-		ci->i_ceph_flags |= flags;
-        } else {
+		set_bit(CEPH_I_POOL_PERM_BIT, &ci->i_ceph_flags);
+		if (ret & POOL_READ)
+			set_bit(CEPH_I_POOL_RD_BIT, &ci->i_ceph_flags);
+		if (ret & POOL_WRITE)
+			set_bit(CEPH_I_POOL_WR_BIT, &ci->i_ceph_flags);
+	} else {
 		pool = ci->i_layout.pool_id;
-		flags = ci->i_ceph_flags;
 	}
+	/* Re-read flags under the lock so check: sees the updated bits. */
+	flags = ci->i_ceph_flags;
 	spin_unlock(&ci->i_ceph_lock);
 	goto check;
 }
